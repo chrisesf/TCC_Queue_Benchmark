@@ -87,6 +87,131 @@ pub fn pack_id(producer_id: u16, sequence: u64) -> u64 {
     ((producer_id as u64) << SEQ_BITS) | (sequence & SEQ_MASK)
 }
 
+/// Mensagem com payload inline de tamanho fixo (`[u8; N]`), exigida pelo ring buffer
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedMessage<const N: usize> {
+    pub id: u64,
+    pub timestamp_ns: u64,
+    pub payload: [u8; N],
+}
+
+/// Contrato que o ambiente de testes usa para criar e inspecionar mensagens,
+/// independente de o payload estar em heap (`Message`) ou inline (`FixedMessage`).
+pub trait BenchMessage: Send + 'static {
+    /// Cria a mensagem copiando `template` para o payload; o timestamp fica zerado e e
+    /// definido com `set_timestamp` imediatamente antes do `push`.
+    fn build(producer_id: u16, sequence: u64, template: &[u8]) -> Self;
+
+    fn id(&self) -> u64;
+
+    fn timestamp_ns(&self) -> u64;
+
+    fn set_timestamp(&mut self, timestamp_ns: u64);
+
+    fn payload(&self) -> &[u8];
+
+    #[inline]
+    fn payload_len(&self) -> usize {
+        self.payload().len()
+    }
+
+    #[inline]
+    fn producer_id(&self) -> u16 {
+        (self.id() >> SEQ_BITS) as u16
+    }
+
+    #[inline]
+    fn sequence(&self) -> u64 {
+        self.id() & SEQ_MASK
+    }
+
+    #[inline]
+    fn latency_ns(&self) -> Option<u64> {
+        now_ns().checked_sub(self.timestamp_ns())
+    }
+}
+
+impl BenchMessage for Message {
+    #[inline]
+    fn build(producer_id: u16, sequence: u64, template: &[u8]) -> Self {
+        Self::with_timestamp(producer_id, sequence, 0, template.to_vec())
+    }
+
+    #[inline]
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[inline]
+    fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    #[inline]
+    fn set_timestamp(&mut self, timestamp_ns: u64) {
+        self.timestamp_ns = timestamp_ns;
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl<const N: usize> BenchMessage for FixedMessage<N> {
+    #[inline]
+    fn build(producer_id: u16, sequence: u64, template: &[u8]) -> Self {
+        let mut payload = [0u8; N];
+        payload.copy_from_slice(template);
+        Self {
+            id: pack_id(producer_id, sequence),
+            timestamp_ns: 0,
+            payload,
+        }
+    }
+
+    #[inline]
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[inline]
+    fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    #[inline]
+    fn set_timestamp(&mut self, timestamp_ns: u64) {
+        self.timestamp_ns = timestamp_ns;
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// Soma de todas as palavras de 64 bits do payload. Obriga o consumidor a ler cada byte,
+/// como uma aplicacao real faria, e permite detectar payload corrompido.
+#[inline]
+pub fn payload_checksum(bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(8);
+    let mut sum = 0u64;
+    for c in &mut chunks {
+        sum = sum.wrapping_add(u64::from_le_bytes(c.try_into().unwrap()));
+    }
+    for &b in chunks.remainder() {
+        sum = sum.wrapping_add(b as u64);
+    }
+    sum
+}
+
+/// Semente do payload de cada produtor, usada para gerar e para validar o conteudo.
+#[inline]
+pub fn payload_seed(producer_id: u16) -> u64 {
+    0x9E3779B9 ^ (producer_id as u64 + 1)
+}
+
 pub struct PayloadFactory {
     template: Vec<u8>,
 }
@@ -115,6 +240,10 @@ impl PayloadFactory {
 
     pub fn size(&self) -> usize {
         self.template.len()
+    }
+
+    pub fn template(&self) -> &[u8] {
+        &self.template
     }
 }
 

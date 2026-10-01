@@ -1,11 +1,16 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::Instant;
 
+static ANCHOR: OnceLock<Instant> = OnceLock::new();
+
+/// Nanossegundos desde uma ancora monotona do processo.
+///
+/// Usa `Instant` (CLOCK_MONOTONIC no Linux), imune a ajustes de NTP. Os valores so
+/// sao comparaveis dentro do mesmo processo, que e onde produtores e consumidores
+/// do benchmark rodam, inclusive nos cenarios com broker.
 #[inline(always)]
 pub fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("relogio do sistema anterior a epoca Unix")
-        .as_nanos() as u64
+    ANCHOR.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 pub struct Stopwatch {

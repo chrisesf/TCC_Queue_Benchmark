@@ -5,6 +5,8 @@ edition = "2021"
 description = "Benchmark comparativo entre filas em memoria e message brokers distribuidos"
 
 [dependencies]
+crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
 
 [profile.release]
 opt-level = 3

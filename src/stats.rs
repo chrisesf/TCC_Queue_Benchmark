@@ -91,13 +91,30 @@ impl RunAggregate {
         }
         let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
         let stddev = var.sqrt();
-        let z = 1.96;
         Self {
             n,
             mean,
             stddev,
-            ci95_half_width: z * stddev / (n as f64).sqrt(),
+            ci95_half_width: t_critical_95(n - 1) * stddev / (n as f64).sqrt(),
         }
+    }
+}
+
+/// Valor critico bicaudal de t de Student para 95% de confianca. Com poucas execucoes
+/// o z = 1,96 subestima o intervalo (df = 9 exige 2,262).
+pub fn t_critical_95(df: usize) -> f64 {
+    const TABLE: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179,
+        2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064,
+        2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+    ];
+    match df {
+        0 => f64::NAN,
+        1..=30 => TABLE[df - 1],
+        31..=40 => 2.021,
+        41..=60 => 2.000,
+        61..=120 => 1.980,
+        _ => 1.960,
     }
 }
 
@@ -110,5 +127,35 @@ pub fn fmt_ns(ns: f64) -> String {
         format!("{:.2} ms", ns / 1_000_000.0)
     } else {
         format!("{:.2} s", ns / 1_000_000_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentis_interpolam_entre_amostras() {
+        let mut v: Vec<u64> = (1..=100).collect();
+        let s = LatencySummary::from_samples(&mut v);
+        assert_eq!(s.min, 1);
+        assert_eq!(s.max, 100);
+        assert_eq!(s.p50, 51); // rank 49.5 -> (50 + 51) / 2 arredondado
+        assert_eq!(s.p99, 99);
+        assert!((s.mean - 50.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ic95_usa_t_de_student() {
+        let values = [10.0, 12.0, 11.0, 13.0, 9.0, 10.0, 12.0, 11.0, 10.0, 12.0];
+        let a = RunAggregate::from(&values);
+        let expected = 2.262 * a.stddev / (10f64).sqrt();
+        assert!((a.ci95_half_width - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn t_converge_para_z() {
+        assert_eq!(t_critical_95(29), 2.045);
+        assert_eq!(t_critical_95(1_000), 1.960);
     }
 }
