@@ -195,12 +195,12 @@ impl<const N: usize> BenchMessage for FixedMessage<N> {
 /// como uma aplicacao real faria, e permite detectar payload corrompido.
 #[inline]
 pub fn payload_checksum(bytes: &[u8]) -> u64 {
-    let mut chunks = bytes.chunks_exact(8);
+    let (words, remainder) = bytes.as_chunks::<8>();
     let mut sum = 0u64;
-    for c in &mut chunks {
-        sum = sum.wrapping_add(u64::from_le_bytes(c.try_into().unwrap()));
+    for w in words {
+        sum = sum.wrapping_add(u64::from_le_bytes(*w));
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         sum = sum.wrapping_add(b as u64);
     }
     sum

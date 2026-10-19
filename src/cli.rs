@@ -3,13 +3,18 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use crate::bench::{run_once, Arrival, RunConfig, RunOutcome};
+use crate::bench::{run, Arrival, RunConfig, RunOutcome};
 use crate::clock::measure_clock_overhead_ns;
 use crate::message::BenchMessage;
 use crate::queue::Queue;
 use crate::stats::{fmt_ns, RunAggregate};
+use crate::transport::{InMemory, Transport};
+
+/// Opcoes adicionais do binario em execucao (ex.: brokers), exibidas junto com `USAGE`.
+static EXTRA_USAGE: OnceLock<&'static str> = OnceLock::new();
 
 pub const USAGE: &str = "\
 Opcoes:
@@ -73,17 +78,31 @@ pub struct Args {
     pub repetitions: usize,
     pub arrival: Arrival,
     pub csv: Option<PathBuf>,
+    /// Valores das opcoes adicionais declaradas em `parse_with`.
+    pub extra: Vec<(String, String)>,
+    /// Tempo maximo sem progresso (ver `RunConfig::idle_timeout`).
+    pub idle_timeout: Duration,
 }
 
 impl Args {
     pub fn parse(default_kind: PayloadKind) -> Self {
+        Self::parse_with(default_kind, &[], "")
+    }
+
+    /// Como `parse`, aceitando tambem `extra_flags` (documentadas em `extra_usage`).
+    pub fn parse_with(
+        default_kind: PayloadKind,
+        extra_flags: &[&str],
+        extra_usage: &'static str,
+    ) -> Self {
+        let _ = EXTRA_USAGE.set(extra_usage);
         let argv: Vec<String> = std::env::args().skip(1).collect();
         if argv.iter().any(|a| a == "--help" || a == "-h") {
-            println!("{USAGE}");
+            println!("{USAGE}{extra_usage}");
             std::process::exit(0);
         }
         for (i, a) in argv.iter().enumerate() {
-            if i % 2 == 0 && !FLAGS.contains(&a.as_str()) {
+            if i % 2 == 0 && !FLAGS.contains(&a.as_str()) && !extra_flags.contains(&a.as_str()) {
                 fail(&format!("opcao desconhecida ou sem valor: {a}"));
             }
         }
@@ -137,6 +156,11 @@ impl Args {
             repetitions: num("--repetitions", 30) as usize,
             arrival,
             csv: get("--csv").map(PathBuf::from),
+            extra: extra_flags
+                .iter()
+                .filter_map(|f| get(f).map(|v| (f.to_string(), v)))
+                .collect(),
+            idle_timeout: Duration::from_secs(120),
         };
         if args.producers == 0 || args.consumers == 0 || args.repetitions == 0 {
             fail("--producers, --consumers e --repetitions devem ser >= 1");
@@ -155,12 +179,31 @@ impl Args {
             warmup_per_producer: self.warmup,
             payload_bytes: self.payload,
             arrival: self.arrival,
+            idle_timeout: self.idle_timeout,
+        }
+    }
+
+    /// Valor de uma opcao adicional, se informada.
+    pub fn extra(&self, flag: &str) -> Option<&str> {
+        self.extra
+            .iter()
+            .find(|(f, _)| f == flag)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn extra_num(&self, flag: &str, default: u64) -> u64 {
+        match self.extra(flag) {
+            Some(v) => v
+                .parse()
+                .unwrap_or_else(|_| fail(&format!("valor invalido para {flag}: {v}"))),
+            None => default,
         }
     }
 }
 
 pub fn fail(msg: &str) -> ! {
-    eprintln!("erro: {msg}\n\n{USAGE}");
+    let extra = EXTRA_USAGE.get().copied().unwrap_or("");
+    eprintln!("erro: {msg}\n\n{USAGE}{extra}");
     std::process::exit(2);
 }
 
@@ -193,11 +236,23 @@ macro_rules! with_message_type {
     };
 }
 
+/// Executa as repeticoes sobre uma fila em memoria nova a cada execucao.
 pub fn run_benchmark<Q, M, F>(title: &str, args: &Args, make_queue: F)
 where
     Q: Queue<M> + 'static,
     M: BenchMessage,
     F: Fn() -> Q,
+{
+    run_transport_benchmark(title, args, || InMemory(Arc::new(make_queue())));
+}
+
+/// Executa as repeticoes sobre um transporte novo a cada execucao (fila, fila AMQP ou
+/// topico recem-criados), imprime o relatorio e grava o CSV.
+pub fn run_transport_benchmark<T, M, F>(title: &str, args: &Args, make_transport: F)
+where
+    T: Transport<M>,
+    M: BenchMessage,
+    F: Fn() -> T,
 {
     let cfg = args.run_config();
     let clock_ns = measure_clock_overhead_ns(200_000);
@@ -234,9 +289,11 @@ where
 
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(args.repetitions);
     for i in 1..=args.repetitions {
-        let queue = Arc::new(make_queue());
-        let queue_name = queue.name();
-        let o = run_once(queue, &cfg);
+        let transport = make_transport();
+        let o = run(&transport, &cfg);
+        let (name, semantics) = (transport.name(), transport.semantics());
+        // Remove fila/topico do broker antes da proxima execucao.
+        drop(transport);
         println!(
             "{:>4}  {:>12.0}  {:>10}  {:>10}  {:>10}  {:>10}  {:>6.2}  {:>6}",
             i,
@@ -249,7 +306,7 @@ where
             o.errors()
         );
         if let Some(f) = csv.as_mut() {
-            write_csv_row(f, queue_name, args, &cfg, i, &o);
+            write_csv_row(f, name, semantics, args, &cfg, i, &o);
         }
         outcomes.push(o);
     }
@@ -291,20 +348,36 @@ where
         "memoria:      pico de RSS {:.1} MiB (+{:.1} MiB acima do inicio da fase medida)",
         a_peak.mean, a_extra.mean
     );
+    if outcomes.iter().all(|o| o.broker_cpu_secs.is_some()) {
+        let a_bcores = agg(|o| o.broker_cpu_cores.unwrap_or(0.0));
+        let a_total = agg(|o| o.total_cpu_ns_per_message());
+        let a_bmem = agg(|o| o.broker_peak_mem_kib.unwrap_or(0) as f64 / 1024.0);
+        println!(
+            "broker:       {:.2} +/- {:.2} nucleos ocupados | pico de memoria {:.1} MiB",
+            a_bcores.mean, a_bcores.ci95_half_width, a_bmem.mean
+        );
+        println!(
+            "cpu total:    {:.0} ns de CPU por mensagem (cliente + broker)",
+            a_total.mean
+        );
+    } else if outcomes.iter().any(|o| o.broker_cpu_secs.is_some()) {
+        println!("broker:       metricas do container indisponiveis em parte das execucoes");
+    }
 
     // --- Corretude ---
     let sum = |f: fn(&RunOutcome) -> u64| -> u64 { outcomes.iter().map(f).sum() };
-    let (lost, dup, ooo, bad, disc) = (
+    let (lost, dup, ooo, bad, disc, rejected) = (
         sum(|o| o.lost()),
         sum(|o| o.duplicated()),
         sum(|o| o.out_of_order),
         sum(|o| o.corrupted),
         sum(|o| o.discarded_samples),
+        sum(|o| o.rejected),
     );
     let sent = sum(|o| o.sent);
     println!();
     println!(
-        "corretude: perdidas={lost} duplicadas={dup} fora_de_ordem={ooo} corrompidas={bad} amostras_descartadas={disc} taxa_de_erro={:.2e}",
+        "corretude: perdidas={lost} duplicadas={dup} fora_de_ordem={ooo} corrompidas={bad} rejeitadas={rejected} amostras_descartadas={disc} taxa_de_erro={:.2e}",
         (lost + dup + ooo + bad) as f64 / sent.max(1) as f64
     );
     if lost == 0 && dup == 0 && ooo == 0 && bad == 0 {
@@ -315,11 +388,11 @@ where
     }
 }
 
-const CSV_HEADER: &str = "queue,payload_kind,topology,producers,consumers,payload_bytes,capacity,\
+const CSV_HEADER: &str = "queue,semantics,payload_kind,topology,producers,consumers,payload_bytes,capacity,\
 arrival,messages_per_producer,warmup_per_producer,repetition,sent,received,lost,duplicated,\
-out_of_order,corrupted,elapsed_s,throughput_msg_s,throughput_mib_s,lat_mean_ns,lat_stddev_ns,lat_min_ns,\
+out_of_order,corrupted,rejected,elapsed_s,throughput_msg_s,throughput_mib_s,lat_mean_ns,lat_stddev_ns,lat_min_ns,\
 lat_p50_ns,lat_p95_ns,lat_p99_ns,lat_p999_ns,lat_max_ns,cpu_s,cpu_cores,cpu_ns_per_msg,\
-rss_baseline_kib,rss_peak_kib";
+rss_baseline_kib,rss_peak_kib,broker_cpu_s,broker_cpu_cores,broker_mem_peak_kib,total_cpu_ns_per_msg";
 
 fn open_csv(path: &PathBuf) -> fs::File {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -341,6 +414,7 @@ fn open_csv(path: &PathBuf) -> fs::File {
 fn write_csv_row(
     f: &mut fs::File,
     queue: &str,
+    semantics: &str,
     args: &Args,
     cfg: &RunConfig,
     repetition: usize,
@@ -349,8 +423,9 @@ fn write_csv_row(
     let l = &o.latency;
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.1},{:.3},{:.1},{:.1},{},{},{},{},{},{},{:.6},{:.3},{:.1},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.1},{:.3},{:.1},{:.1},{},{},{},{},{},{},{:.6},{:.3},{:.1},{},{},{},{},{},{:.1}",
         queue,
+        semantics,
         args.payload_kind.label(),
         cfg.topology(),
         cfg.producers,
@@ -367,6 +442,7 @@ fn write_csv_row(
         o.duplicated(),
         o.out_of_order,
         o.corrupted,
+        o.rejected,
         o.elapsed_secs,
         o.throughput,
         o.byte_throughput / (1024.0 * 1024.0),
@@ -383,6 +459,10 @@ fn write_csv_row(
         o.cpu_ns_per_message(),
         o.baseline_rss_kib,
         o.peak_rss_kib,
+        o.broker_cpu_secs.map(|c| format!("{c:.6}")).unwrap_or_default(),
+        o.broker_cpu_cores.map(|c| format!("{c:.3}")).unwrap_or_default(),
+        o.broker_peak_mem_kib.map(|m| m.to_string()).unwrap_or_default(),
+        o.total_cpu_ns_per_message(),
     )
     .expect("falha ao escrever CSV");
 }

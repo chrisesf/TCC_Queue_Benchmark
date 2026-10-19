@@ -1,11 +1,13 @@
 //! Verifica as metricas produzidas pelo ambiente de testes (`run_once`).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tcc_bench::bench::{run_once, Arrival, RunConfig, RunOutcome};
+use tcc_bench::bench::{run, run_once, Arrival, RunConfig, RunOutcome};
 use tcc_bench::message::{BenchMessage, FixedMessage, Message};
 use tcc_bench::queue::{PushError, Queue};
 use tcc_bench::queues::{MichaelScottQueue, MutexQueue, RingBuffer};
+use tcc_bench::transport::{Consumer, Producer, Recv, Transport};
 
 fn cfg(producers: usize, consumers: usize, arrival: Arrival) -> RunConfig {
     RunConfig {
@@ -15,6 +17,7 @@ fn cfg(producers: usize, consumers: usize, arrival: Arrival) -> RunConfig {
         warmup_per_producer: 500,
         payload_bytes: 64,
         arrival,
+        idle_timeout: Duration::from_secs(30),
     }
 }
 
@@ -158,6 +161,127 @@ fn payload_corrompido_e_detectado() {
     let o = run_once(Arc::new(FilaQueCorrompe(MutexQueue::with_capacity(64))), &c);
     assert_eq!(o.lost() + o.duplicated() + o.out_of_order, 0);
     assert_eq!(o.corrupted, 2, "uma mensagem corrompida por produtor");
+}
+
+/// Simula um broker: nao ha fila fechavel (`finish` nao faz nada) e o consumidor devolve
+/// `Empty` quando nada chega. De cada produtor, as sequencias em `perde` somem depois de
+/// aceitas e as em `rejeita` sao recusadas na confirmacao (nack, devolvidas por `flush`).
+struct BrokerSimulado {
+    fila: Arc<MutexQueue<Message>>,
+    perde: &'static [u64],
+    rejeita: &'static [u64],
+}
+
+impl BrokerSimulado {
+    fn new(perde: &'static [u64], rejeita: &'static [u64]) -> Self {
+        Self {
+            fila: Arc::new(MutexQueue::with_capacity(256)),
+            perde,
+            rejeita,
+        }
+    }
+}
+
+struct ProdutorSimulado {
+    fila: Arc<MutexQueue<Message>>,
+    perde: &'static [u64],
+    rejeita: &'static [u64],
+    rejeitadas: u64,
+}
+
+struct ConsumidorSimulado(Arc<MutexQueue<Message>>);
+
+impl Transport<Message> for BrokerSimulado {
+    type Producer = ProdutorSimulado;
+    type Consumer = ConsumidorSimulado;
+
+    fn producer(&self, _index: usize) -> ProdutorSimulado {
+        ProdutorSimulado {
+            fila: Arc::clone(&self.fila),
+            perde: self.perde,
+            rejeita: self.rejeita,
+            rejeitadas: 0,
+        }
+    }
+    fn consumer(&self, _index: usize) -> ConsumidorSimulado {
+        ConsumidorSimulado(Arc::clone(&self.fila))
+    }
+    fn name(&self) -> &'static str {
+        "broker-simulado"
+    }
+}
+
+impl Producer<Message> for ProdutorSimulado {
+    fn send(&mut self, msg: Message) -> Result<(), Message> {
+        let seq = msg.sequence();
+        if self.perde.contains(&seq) {
+            return Ok(());
+        }
+        if self.rejeita.contains(&seq) {
+            self.rejeitadas += 1;
+            return Ok(());
+        }
+        self.fila.push(msg).map_err(|e| e.into_inner())
+    }
+    fn flush(&mut self) -> u64 {
+        std::mem::take(&mut self.rejeitadas)
+    }
+}
+
+impl Consumer<Message> for ConsumidorSimulado {
+    fn recv(&mut self, timeout: Duration) -> Recv<Message> {
+        match self.0.try_pop() {
+            Some(m) => Recv::Message(m),
+            None => {
+                std::thread::sleep(timeout.min(Duration::from_micros(200)));
+                Recv::Empty
+            }
+        }
+    }
+}
+
+#[test]
+fn transporte_sem_fechamento_contabiliza_rejeicao_e_perda() {
+    let mut c = cfg(2, 2, Arrival::Saturated);
+    c.idle_timeout = Duration::from_millis(300);
+    let o = run(&BrokerSimulado::new(&[1_200], &[1_300]), &c);
+    assert_eq!(o.rejected, 2);
+    assert_eq!(o.sent, c.total_messages() - 2, "rejeitadas nao contam como enviadas");
+    assert_eq!(o.lost(), 2);
+    assert_eq!(o.received, o.sent - 2);
+    assert_eq!(o.duplicated() + o.out_of_order + o.corrupted, 0);
+    assert!(
+        o.elapsed_secs < c.idle_timeout.as_secs_f64(),
+        "a espera por mensagens perdidas nao deve entrar no tempo medido: {}",
+        o.elapsed_secs
+    );
+}
+
+#[test]
+fn transporte_sem_perda_encerra_sem_esperar_ociosidade() {
+    let mut c = cfg(3, 2, Arrival::Saturated);
+    c.idle_timeout = Duration::from_secs(60);
+    let inicio = Instant::now();
+    let o = run(&BrokerSimulado::new(&[], &[]), &c);
+    assert_consistente(&o, &c);
+    assert!(
+        inicio.elapsed() < Duration::from_secs(30),
+        "consumidores deveriam encerrar ao receber todas as mensagens medidas"
+    );
+}
+
+#[test]
+fn perda_no_warmup_nao_atrasa_o_fim_nem_conta_como_erro() {
+    let mut c = cfg(2, 2, Arrival::Saturated);
+    c.idle_timeout = Duration::from_secs(1);
+    let inicio = Instant::now();
+    // A sequencia 100 pertence ao warm-up (500 por produtor).
+    let o = run(&BrokerSimulado::new(&[100], &[]), &c);
+    let total = inicio.elapsed();
+    assert_consistente(&o, &c);
+    // Espera 1 s pelo warm-up incompleto, mas nao de novo ao final.
+    assert!(total >= Duration::from_secs(1));
+    assert!(total < Duration::from_millis(1_800), "fim esperou ociosidade: {total:?}");
 }
 
 #[test]

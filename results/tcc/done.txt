@@ -1,0 +1,5 @@
+mem mutex_bench heap p4 c4 b64 burst
+mem mutex_bench heap p4 c4 b64 paced
+mem michael_scott_bench heap p4 c4 b64 burst
+mem michael_scott_bench heap p4 c4 b64 paced
+mem ring_buffer_bench inline p4 c4 b64 burst

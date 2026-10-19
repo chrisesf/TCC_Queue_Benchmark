@@ -118,6 +118,164 @@ pub fn t_critical_95(df: usize) -> f64 {
     }
 }
 
+/// Resultado de um teste bicaudal entre duas amostras de execucoes independentes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwoSampleTest {
+    /// `t` (Welch) ou `mann-whitney`, escolhido pela normalidade (Secao 4.6).
+    pub name: &'static str,
+    pub statistic: f64,
+    pub significant_95: bool,
+}
+
+/// Verdadeiro quando a amostra nao rejeita normalidade a 5% (Jarque-Bera). Amostras
+/// curtas ou constantes nao sustentam o teste t.
+pub fn looks_normal(values: &[f64]) -> bool {
+    let n = values.len();
+    if n < 8 {
+        return false;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let mut m2 = 0.0;
+    let mut m3 = 0.0;
+    let mut m4 = 0.0;
+    for v in values {
+        let d = v - mean;
+        let d2 = d * d;
+        m2 += d2;
+        m3 += d2 * d;
+        m4 += d2 * d2;
+    }
+    let n = n as f64;
+    m2 /= n;
+    m3 /= n;
+    m4 /= n;
+    if m2 == 0.0 {
+        return true;
+    }
+    let skew = m3 / m2.powf(1.5);
+    let kurt = m4 / (m2 * m2);
+    let jb = n / 6.0 * (skew * skew + (kurt - 3.0).powi(2) / 4.0);
+    jb <= 5.99146454710798
+}
+
+/// Teste t de Welch (variancias diferentes). `statistic` e t com sinal de media(a)-media(b).
+pub fn welch_t_test(a: &[f64], b: &[f64]) -> Option<TwoSampleTest> {
+    if a.len() < 2 || b.len() < 2 {
+        return None;
+    }
+    let (mean_a, std_a) = mean_stddev(a);
+    let (mean_b, std_b) = mean_stddev(b);
+    let var_a = std_a * std_a / a.len() as f64;
+    let var_b = std_b * std_b / b.len() as f64;
+    let se2 = var_a + var_b;
+    if se2 == 0.0 {
+        return Some(TwoSampleTest {
+            name: "t",
+            statistic: 0.0,
+            significant_95: false,
+        });
+    }
+    let t = (mean_a - mean_b) / se2.sqrt();
+    let df = se2 * se2 / (var_a * var_a / (a.len() - 1) as f64 + var_b * var_b / (b.len() - 1) as f64);
+    Some(TwoSampleTest {
+        name: "t",
+        statistic: t,
+        significant_95: t.abs() > t_critical_interp(df),
+    })
+}
+
+/// Mann-Whitney bicaudal, com correcao de empates e de continuidade.
+/// `statistic` e z com sinal: positivo quando `a` tende a valores maiores que `b`.
+pub fn mann_whitney(a: &[f64], b: &[f64]) -> Option<TwoSampleTest> {
+    let n1 = a.len();
+    let n2 = b.len();
+    if n1 == 0 || n2 == 0 {
+        return None;
+    }
+    let mut tagged: Vec<(f64, u8)> = a.iter().map(|&v| (v, 0u8)).chain(b.iter().map(|&v| (v, 1u8))).collect();
+    tagged.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut rank_sum_a = 0.0;
+    let mut tie_correction = 0.0;
+    let mut i = 0;
+    while i < tagged.len() {
+        let mut j = i + 1;
+        while j < tagged.len() && tagged[j].0 == tagged[i].0 {
+            j += 1;
+        }
+        let count = (j - i) as f64;
+        let average_rank = (i + 1 + j) as f64 / 2.0;
+        for item in &tagged[i..j] {
+            if item.1 == 0 {
+                rank_sum_a += average_rank;
+            }
+        }
+        if count > 1.0 {
+            tie_correction += count.powi(3) - count;
+        }
+        i = j;
+    }
+
+    let n1f = n1 as f64;
+    let n2f = n2 as f64;
+    let total = n1f + n2f;
+    let u1 = rank_sum_a - n1f * (n1f + 1.0) / 2.0;
+    let mu = n1f * n2f / 2.0;
+    let sigma2 = if total > 1.0 {
+        n1f * n2f / 12.0 * ((total + 1.0) - tie_correction / (total * (total - 1.0)))
+    } else {
+        0.0
+    };
+    let z = if sigma2 <= 0.0 {
+        0.0
+    } else {
+        let diff = u1 - mu;
+        let corrected = if diff > 0.0 {
+            diff - 0.5
+        } else if diff < 0.0 {
+            diff + 0.5
+        } else {
+            0.0
+        };
+        corrected / sigma2.sqrt()
+    };
+    Some(TwoSampleTest {
+        name: "mann-whitney",
+        statistic: z,
+        significant_95: z.abs() > 1.959963984540054,
+    })
+}
+
+/// Welch se as duas amostras parecem normais; caso contrario Mann-Whitney (Secao 4.6).
+pub fn compare_samples(a: &[f64], b: &[f64]) -> Option<TwoSampleTest> {
+    if looks_normal(a) && looks_normal(b) {
+        welch_t_test(a, b)
+    } else {
+        mann_whitney(a, b)
+    }
+}
+
+fn mean_stddev(values: &[f64]) -> (f64, f64) {
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    (mean, var.sqrt())
+}
+
+fn t_critical_interp(df: f64) -> f64 {
+    if df <= 1.0 {
+        return t_critical_95(1);
+    }
+    let lo = df.floor() as usize;
+    let hi = df.ceil() as usize;
+    if lo == hi {
+        t_critical_95(lo)
+    } else {
+        let frac = df - lo as f64;
+        t_critical_95(lo) * (1.0 - frac) + t_critical_95(hi) * frac
+    }
+}
+
 pub fn fmt_ns(ns: f64) -> String {
     if ns < 1_000.0 {
         format!("{:.0} ns", ns)
@@ -157,5 +315,36 @@ mod tests {
     fn t_converge_para_z() {
         assert_eq!(t_critical_95(29), 2.045);
         assert_eq!(t_critical_95(1_000), 1.960);
+    }
+
+    #[test]
+    fn welch_detecta_medias_separadas_e_poupa_iguais() {
+        let a = [1.0, 2.0, 3.0, 2.0, 1.5, 2.5, 1.8, 2.2];
+        let b = [1.1, 1.9, 2.4, 1.6, 2.1, 1.7, 2.3, 1.8];
+        let same = welch_t_test(&a, &b).unwrap();
+        assert_eq!(same.name, "t");
+        assert!(!same.significant_95);
+
+        let c = [10.0, 11.0, 12.0, 10.5, 11.5, 12.5, 10.2, 11.8];
+        let diff = welch_t_test(&a, &c).unwrap();
+        assert!(diff.significant_95);
+        assert!(diff.statistic < 0.0);
+    }
+
+    #[test]
+    fn mann_whitney_ordena_amostras_sem_sobreposicao() {
+        let low = [1.0, 2.0, 3.0, 4.0];
+        let high = [10.0, 11.0, 12.0, 13.0];
+        let t = mann_whitney(&high, &low).unwrap();
+        assert!(t.significant_95);
+        assert!(t.statistic > 0.0);
+        let tied = mann_whitney(&low, &low).unwrap();
+        assert!(!tied.significant_95);
+    }
+
+    #[test]
+    fn amostra_constante_nao_rejeita_normalidade() {
+        assert!(looks_normal(&[2.0; 10]));
+        assert!(!looks_normal(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0]));
     }
 }
