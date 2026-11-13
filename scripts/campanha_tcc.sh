@@ -9,9 +9,12 @@
 #   PRODUCERS=4
 #   CONSUMERS=4
 #   OUT=results/tcc
-#   BIN_DIR=/build/release     (no container) ou target/release
+#   BIN_DIR=target/release
+#   AMQP_URL=amqp://127.0.0.1:5672/%2f
+#   KAFKA_BROKERS=127.0.0.1:9092
+#   BROKER_CONTAINER=none      (sem Docker nao ha stats do container)
 #
-# Uso no container:
+# Uso nativo (via rodar_vm.sh):
 #   PHASE=memoria sh scripts/campanha_tcc.sh
 #   PHASE=brokers sh scripts/campanha_tcc.sh
 
@@ -107,6 +110,9 @@ fi
 
 producers=$PRODUCERS
 consumers=$CONSUMERS
+AMQP_URL=${AMQP_URL:-amqp://127.0.0.1:5672/%2f}
+KAFKA_BROKERS=${KAFKA_BROKERS:-127.0.0.1:9092}
+BROKER_CONTAINER=${BROKER_CONTAINER:-none}
 
 for payload in 64 1024 65536; do
   msgs=$(msgs_for "$producers" "$payload")
@@ -145,12 +151,14 @@ for payload in 64 1024 65536; do
     for sem in at-most-once at-least-once; do
       run "rabbit $sem p${producers} c${consumers} b${payload} burst" \
         "$BIN_DIR/rabbitmq_bench" --semantics "$sem" \
+        --amqp-url "$AMQP_URL" --broker-container "$BROKER_CONTAINER" \
         --producers "$producers" --consumers "$consumers" \
         --payload "$payload" --messages "$msgs" --warmup "$warm" --repetitions "$REPS" \
         --arrival burst --batch 1000 --pause-ns 1000000 --idle-timeout-ms 500 \
         --csv "$OUT/brokers.csv"
       run "rabbit $sem p${producers} c${consumers} b${payload} paced" \
         "$BIN_DIR/rabbitmq_bench" --semantics "$sem" \
+        --amqp-url "$AMQP_URL" --broker-container "$BROKER_CONTAINER" \
         --producers "$producers" --consumers "$consumers" \
         --payload "$payload" --messages "$pmsgs" --warmup "$pwarm" --repetitions "$REPS" \
         --arrival paced --rate "$rate" --idle-timeout-ms 500 \
@@ -159,12 +167,14 @@ for payload in 64 1024 65536; do
     for sem in at-most-once at-least-once exactly-once; do
       run "kafka $sem p${producers} c${consumers} b${payload} burst" \
         "$BIN_DIR/kafka_bench" --semantics "$sem" \
+        --kafka-brokers "$KAFKA_BROKERS" --broker-container "$BROKER_CONTAINER" \
         --producers "$producers" --consumers "$consumers" \
         --payload "$payload" --messages "$msgs" --warmup "$warm" --repetitions "$REPS" \
         --arrival burst --batch 1000 --pause-ns 1000000 --tx-batch "$tx" --idle-timeout-ms 500 \
         --csv "$OUT/brokers.csv"
       run "kafka $sem p${producers} c${consumers} b${payload} paced" \
         "$BIN_DIR/kafka_bench" --semantics "$sem" \
+        --kafka-brokers "$KAFKA_BROKERS" --broker-container "$BROKER_CONTAINER" \
         --producers "$producers" --consumers "$consumers" \
         --payload "$payload" --messages "$pmsgs" --warmup "$pwarm" --repetitions "$REPS" \
         --arrival paced --rate "$rate" --tx-batch "$tx" --idle-timeout-ms 500 \
