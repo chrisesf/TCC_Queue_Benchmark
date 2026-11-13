@@ -4,6 +4,9 @@
 
 set -eu
 
+export LANG="${LANG:-C.UTF-8}"
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+
 if [ -f "$HOME/.tcc-bench-env" ]; then
   # shellcheck disable=SC1091
   . "$HOME/.tcc-bench-env"

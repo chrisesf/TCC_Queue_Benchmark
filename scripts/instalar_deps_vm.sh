@@ -11,6 +11,11 @@
 
 set -eu
 
+# VMs academicas muitas vezes nao tem locale gerado; sem isso o JDK falha com
+# "platform encoding not initialized".
+export LANG="${LANG:-C.UTF-8}"
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+
 OPT=${OPT:-$HOME/opt}
 KAFKA_VERSION=4.3.1
 # RabbitMQ 4.x pede Erlang 26+.
@@ -65,7 +70,10 @@ if [ ! -x "$OPT/jdk/bin/java" ]; then
   mv jdk-21* "$OPT/jdk"
   rm -rf "$TMP"
 fi
-"$OPT/jdk/bin/java" -version
+if ! "$OPT/jdk/bin/java" -version; then
+  echo "JDK falhou ao iniciar. Tentando com LANG=C..." >&2
+  LANG=C LC_ALL=C "$OPT/jdk/bin/java" -version
+fi
 
 echo "=== Erlang OTP $ERLANG_VERSION (build Hex, usuario) ==="
 if [ ! -x "$OPT/erlang/Install" ] && [ ! -x "$OPT/erlang/bin/erl" ]; then
@@ -159,6 +167,8 @@ fi
 
 # env file carregado pelos scripts da campanha
 cat > "$HOME/.tcc-bench-env" <<EOF
+export LANG="\${LANG:-C.UTF-8}"
+export LC_ALL="\${LC_ALL:-C.UTF-8}"
 export JAVA_HOME="$OPT/jdk"
 export PATH="$PATH_SNIP:\$PATH"
 export KAFKA_HOME="$KAFKA_HOME"
