@@ -1,25 +1,33 @@
 #!/bin/sh
-# Sobe / para / status do Kafka local (KRaft), sem Docker.
+# Sobe / para / status do Kafka local (KRaft), sem Docker/sudo.
 # Uso: ./scripts/kafka_local.sh start|stop|status
 
 set -eu
+
+if [ -f "$HOME/.tcc-bench-env" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.tcc-bench-env"
+fi
 
 KAFKA_HOME=${KAFKA_HOME:-$HOME/kafka}
 PROP=$KAFKA_HOME/config/kraft/tcc.properties
 PIDFILE=$KAFKA_HOME/kafka.pid
 LOG=$KAFKA_HOME/logs/server.log
+export JAVA_HOME="${JAVA_HOME:-$HOME/opt/jdk}"
+export PATH="$JAVA_HOME/bin:$PATH"
 export KAFKA_HEAP_OPTS="${KAFKA_HEAP_OPTS:--Xms2G -Xmx2G}"
 
 cmd=${1:-status}
 
 if [ ! -d "$KAFKA_HOME" ]; then
   echo "Kafka nao encontrado em $KAFKA_HOME" >&2
-  echo "rode: sudo ./scripts/instalar_deps_vm.sh" >&2
+  echo "rode: ./scripts/instalar_deps_vm.sh" >&2
   exit 1
 fi
 
 is_up() {
-  ss -lnt 2>/dev/null | grep -q ':9092 ' || \
+  ss -lnt 2>/dev/null | grep -q '127.0.0.1:9092' || \
+    ss -lnt 2>/dev/null | grep -q ':9092 ' || \
     netstat -lnt 2>/dev/null | grep -q ':9092 '
 }
 
@@ -33,13 +41,16 @@ case "$cmd" in
     if [ ! -f "$KAFKA_HOME/data/meta.properties" ]; then
       echo "formatando storage KRaft..."
       CLUSTER_ID=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
-      "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$PROP" --standalone
+      if ! "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$PROP" --standalone
+      then
+        "$KAFKA_HOME/bin/kafka-storage.sh" format -t "$CLUSTER_ID" -c "$PROP"
+      fi
     fi
     echo "iniciando Kafka..."
     nohup "$KAFKA_HOME/bin/kafka-server-start.sh" "$PROP" >"$LOG" 2>&1 &
     echo $! >"$PIDFILE"
     i=0
-    while [ "$i" -lt 60 ]; do
+    while [ "$i" -lt 90 ]; do
       if is_up; then
         echo "Kafka ok (pid $(cat "$PIDFILE"))"
         exit 0
@@ -54,7 +65,6 @@ case "$cmd" in
   stop)
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
       kill "$(cat "$PIDFILE")" 2>/dev/null || true
-      # espera graceful
       i=0
       while [ "$i" -lt 20 ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; do
         i=$((i + 1))
@@ -63,7 +73,6 @@ case "$cmd" in
       kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true
       rm -f "$PIDFILE"
     fi
-    # fallback: mata pelo script de start se sobrou processo
     pkill -f "kafka.Kafka $PROP" 2>/dev/null || true
     echo "Kafka parado"
     ;;

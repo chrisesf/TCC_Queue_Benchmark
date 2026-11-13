@@ -1,54 +1,133 @@
 #!/bin/sh
-# Instala Rust, dependencias de build, RabbitMQ e Kafka na VM (sem Docker).
-# Uso: sudo ./scripts/instalar_deps_vm.sh
-#      (o cargo/rustup fica no usuario que chamar rustup-init; rode a parte
-#       do Rust sem sudo se preferir — veja o final do script.)
+# Instala tudo no $HOME, sem root/sudo:
+#   Rust (rustup), JDK, Kafka (KRaft), Erlang + RabbitMQ (generic-unix).
+#
+# Uso:
+#   chmod +x scripts/*.sh
+#   ./scripts/instalar_deps_vm.sh
+#
+# Precisa de gcc/g++/make/cmake/pkg-config/zlib no sistema (geralmente ja
+# existem em VMs academicas). Sem isso o cliente Kafka (librdkafka) nao compila.
 
 set -eu
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "rode com sudo: sudo $0" >&2
+OPT=${OPT:-$HOME/opt}
+KAFKA_VERSION=4.3.1
+# RabbitMQ 4.x pede Erlang 26+.
+ERLANG_VERSION=26.2.5
+RABBIT_VERSION=4.0.5
+JDK_VERSION=21.0.6+7
+JDK_URL_VERSION=21.0.6%2B7
+
+mkdir -p "$OPT" "$HOME/bin"
+PATH_SNIP="$OPT/jdk/bin:$OPT/erlang/bin:$OPT/rabbitmq/sbin:$HOME/kafka/bin:$HOME/.cargo/bin"
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "comando obrigatorio ausente: $1" >&2
+    echo "peca ao admin para instalar as ferramentas de build (gcc, cmake, pkg-config, zlib)." >&2
+    exit 1
+  fi
+}
+
+echo "=== checagem de ferramentas de build (sem instalar) ==="
+need_cmd curl
+need_cmd tar
+need_cmd gcc
+need_cmd g++
+need_cmd make
+need_cmd cmake
+need_cmd pkg-config
+# zlib headers: tenta compilar um include minimo
+if ! echo '#include <zlib.h>' | gcc -E - >/dev/null 2>&1; then
+  echo "libz (zlib.h) ausente. peca zlib1g-dev ao admin." >&2
   exit 1
 fi
+echo "ok: gcc=$(gcc -dumpversion) cmake=$(cmake --version | head -1)"
 
-REAL_USER=${SUDO_USER:-$USER}
-REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
-KAFKA_VERSION=4.3.1
-KAFKA_DIR=$REAL_HOME/kafka
+echo "=== Rust (rustup, usuario) ==="
+if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+fi
+# shellcheck disable=SC1091
+. "$HOME/.cargo/env"
+rustc --version
+cargo --version
 
-echo "=== pacotes do sistema ==="
-apt-get update
-apt-get install -y --no-install-recommends \
-  build-essential pkg-config cmake perl python3 zlib1g-dev \
-  curl ca-certificates git procps htop \
-  openjdk-21-jre-headless \
-  rabbitmq-server
+echo "=== JDK Temurin $JDK_VERSION ==="
+if [ ! -x "$OPT/jdk/bin/java" ]; then
+  TMP=$(mktemp -d)
+  cd "$TMP"
+  curl -fsSL -o jdk.tgz \
+    "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-${JDK_URL_VERSION}/OpenJDK21U-jdk_x64_linux_hotspot_$(echo "$JDK_VERSION" | tr '+' '_').tar.gz"
+  tar -xzf jdk.tgz
+  rm -rf "$OPT/jdk"
+  mv jdk-21* "$OPT/jdk"
+  rm -rf "$TMP"
+fi
+"$OPT/jdk/bin/java" -version
 
-echo "=== RabbitMQ ==="
-systemctl enable --now rabbitmq-server
-rabbitmqctl await_startup || true
-rabbitmqctl status >/dev/null
-echo "RabbitMQ ok em amqp://127.0.0.1:5672"
+echo "=== Erlang OTP $ERLANG_VERSION (build Hex, usuario) ==="
+if [ ! -x "$OPT/erlang/Install" ] && [ ! -x "$OPT/erlang/bin/erl" ]; then
+  TMP=$(mktemp -d)
+  cd "$TMP"
+  # Builds oficiais usados pelo Hex/Elixir CI (Ubuntu 20.04/22.04 x86_64).
+  for dist in ubuntu-22.04 ubuntu-20.04; do
+    if curl -fsSL -o otp.tgz \
+      "https://repo.hex.pm/builds/otp/${dist}/OTP-${ERLANG_VERSION}.tar.gz"
+    then
+      break
+    fi
+  done
+  if [ ! -f otp.tgz ]; then
+    echo "falha ao baixar Erlang OTP-${ERLANG_VERSION}" >&2
+    exit 1
+  fi
+  rm -rf "$OPT/erlang"
+  mkdir -p "$OPT/erlang"
+  tar -xzf otp.tgz -C "$OPT/erlang"
+  # O tarball do Hex vem com script Install; gera bin/erl no destino.
+  if [ -x "$OPT/erlang/Install" ]; then
+    (cd "$OPT/erlang" && ./Install -sasl "$OPT/erlang")
+  fi
+  rm -rf "$TMP"
+fi
+export PATH="$OPT/erlang/bin:$PATH"
+if [ ! -x "$OPT/erlang/bin/erl" ]; then
+  echo "Erlang instalado, mas bin/erl nao encontrado em $OPT/erlang" >&2
+  ls -la "$OPT/erlang" >&2 || true
+  exit 1
+fi
+erl -eval 'erlang:display(erlang:system_info(otp_release)), halt().' -noshell
 
-echo "=== Kafka $KAFKA_VERSION (KRaft, broker unico) ==="
-install -d -o "$REAL_USER" -g "$REAL_USER" "$KAFKA_DIR"
-TMP=$(mktemp -d)
-cd "$TMP"
-curl -fsSL -o kafka.tgz \
-  "https://downloads.apache.org/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz" \
-  || curl -fsSL -o kafka.tgz \
-  "https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz"
-tar -xzf kafka.tgz
-# conteudo em kafka_2.13-VERSION/
-SRC=$(echo kafka_2.13-*)
-# copia preservando dono
-rm -rf "$KAFKA_DIR"/*
-cp -a "$SRC"/. "$KAFKA_DIR"/
-chown -R "$REAL_USER:$REAL_USER" "$KAFKA_DIR"
-rm -rf "$TMP"
+echo "=== RabbitMQ $RABBIT_VERSION (generic-unix) ==="
+if [ ! -x "$OPT/rabbitmq/sbin/rabbitmq-server" ]; then
+  TMP=$(mktemp -d)
+  cd "$TMP"
+  curl -fsSL -o rabbit.txz \
+    "https://github.com/rabbitmq/rabbitmq-server/releases/download/v${RABBIT_VERSION}/rabbitmq-server-generic-unix-${RABBIT_VERSION}.tar.xz"
+  tar -xJf rabbit.txz
+  rm -rf "$OPT/rabbitmq"
+  mv rabbitmq_server-* "$OPT/rabbitmq"
+  rm -rf "$TMP"
+fi
 
-# Config KRaft single-node (listener so em localhost).
-cat > "$KAFKA_DIR/config/kraft/tcc.properties" <<EOF
+echo "=== Kafka $KAFKA_VERSION ==="
+KAFKA_HOME=$HOME/kafka
+if [ ! -x "$KAFKA_HOME/bin/kafka-server-start.sh" ]; then
+  TMP=$(mktemp -d)
+  cd "$TMP"
+  curl -fsSL -o kafka.tgz \
+    "https://downloads.apache.org/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz" \
+    || curl -fsSL -o kafka.tgz \
+    "https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/kafka_2.13-${KAFKA_VERSION}.tgz"
+  tar -xzf kafka.tgz
+  rm -rf "$KAFKA_HOME"
+  mv kafka_2.13-* "$KAFKA_HOME"
+  rm -rf "$TMP"
+fi
+mkdir -p "$KAFKA_HOME/data" "$KAFKA_HOME/logs"
+cat > "$KAFKA_HOME/config/kraft/tcc.properties" <<EOF
 process.roles=broker,controller
 node.id=1
 controller.quorum.voters=1@127.0.0.1:9093
@@ -56,38 +135,45 @@ listeners=PLAINTEXT://127.0.0.1:9092,CONTROLLER://127.0.0.1:9093
 advertised.listeners=PLAINTEXT://127.0.0.1:9092
 listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
 controller.listener.names=CONTROLLER
-log.dirs=$KAFKA_DIR/data
+log.dirs=$KAFKA_HOME/data
 num.network.threads=8
 num.io.threads=8
-socket.send.buffer.bytes=102400
-socket.receive.buffer.bytes=102400
-socket.request.max.bytes=104857600
-num.partitions=1
 offsets.topic.replication.factor=1
 transaction.state.log.replication.factor=1
 transaction.state.log.min.isr=1
 group.initial.rebalance.delay.ms=0
 auto.create.topics.enable=false
 EOF
-chown "$REAL_USER:$REAL_USER" "$KAFKA_DIR/config/kraft/tcc.properties"
-install -d -o "$REAL_USER" -g "$REAL_USER" "$KAFKA_DIR/data" "$KAFKA_DIR/logs"
 
-echo "=== Rust (usuario $REAL_USER) ==="
-if [ ! -x "$REAL_HOME/.cargo/bin/cargo" ]; then
-  sudo -u "$REAL_USER" -H bash -lc \
-    'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable'
+# PATH persistente
+PROFILE=$HOME/.bashrc
+MARKER="# tcc-bench PATH"
+if ! grep -Fq "$MARKER" "$PROFILE" 2>/dev/null; then
+  {
+    echo ""
+    echo "$MARKER"
+    echo "export JAVA_HOME=\"$OPT/jdk\""
+    echo "export PATH=\"$PATH_SNIP:\$PATH\""
+  } >> "$PROFILE"
 fi
-sudo -u "$REAL_USER" -H bash -lc 'rustc --version; cargo --version'
+
+# env file carregado pelos scripts da campanha
+cat > "$HOME/.tcc-bench-env" <<EOF
+export JAVA_HOME="$OPT/jdk"
+export PATH="$PATH_SNIP:\$PATH"
+export KAFKA_HOME="$KAFKA_HOME"
+export RABBITMQ_HOME="$OPT/rabbitmq"
+export ERLANG_HOME="$OPT/erlang"
+EOF
 
 cat <<EOF
 
-Dependencias instaladas.
-Proximos passos (como $REAL_USER):
+Instalacao concluida (tudo em $HOME, sem sudo).
 
-  cd ~/TCC_Queue_Benchmark   # ou onde clonou o repo
-  chmod +x scripts/*.sh
+Carregue o ambiente:
+  . "\$HOME/.tcc-bench-env"
+
+Depois:
+  cd ~/TCC_Queue_Benchmark
   ./scripts/rodar_vm.sh
-
-Kafka fica em $KAFKA_DIR (o rodar_vm.sh sobe e desce sozinho).
-RabbitMQ ja esta como servico (systemctl status rabbitmq-server).
 EOF
