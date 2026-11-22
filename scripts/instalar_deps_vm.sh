@@ -76,7 +76,7 @@ if ! "$OPT/jdk/bin/java" -version; then
 fi
 
 echo "=== Erlang OTP $ERLANG_VERSION (build Hex, usuario) ==="
-if [ ! -x "$OPT/erlang/Install" ] && [ ! -x "$OPT/erlang/bin/erl" ]; then
+if [ ! -x "$OPT/erlang/bin/erl" ]; then
   TMP=$(mktemp -d)
   cd "$TMP"
   # Builds oficiais usados pelo Hex/Elixir CI (Ubuntu 20.04/22.04 x86_64).
@@ -94,7 +94,17 @@ if [ ! -x "$OPT/erlang/Install" ] && [ ! -x "$OPT/erlang/bin/erl" ]; then
   rm -rf "$OPT/erlang"
   mkdir -p "$OPT/erlang"
   tar -xzf otp.tgz -C "$OPT/erlang"
-  # O tarball do Hex vem com script Install; gera bin/erl no destino.
+  # O tarball do Hex costuma vir como OTP-X.Y.Z/{Install,bin,...}.
+  if [ ! -x "$OPT/erlang/Install" ]; then
+    INNER=$(find "$OPT/erlang" -mindepth 1 -maxdepth 2 -type f -name Install | head -1)
+    if [ -n "$INNER" ]; then
+      BASE=$(CDPATH= cd -- "$(dirname "$INNER")" && pwd)
+      rm -rf "$OPT/erlang.staging"
+      mv "$BASE" "$OPT/erlang.staging"
+      rm -rf "$OPT/erlang"
+      mv "$OPT/erlang.staging" "$OPT/erlang"
+    fi
+  fi
   if [ -x "$OPT/erlang/Install" ]; then
     (cd "$OPT/erlang" && ./Install -sasl "$OPT/erlang")
   fi
@@ -134,7 +144,7 @@ if [ ! -x "$KAFKA_HOME/bin/kafka-server-start.sh" ]; then
   mv kafka_2.13-* "$KAFKA_HOME"
   rm -rf "$TMP"
 fi
-mkdir -p "$KAFKA_HOME/data" "$KAFKA_HOME/logs"
+mkdir -p "$KAFKA_HOME/data" "$KAFKA_HOME/logs" "$KAFKA_HOME/config/kraft"
 cat > "$KAFKA_HOME/config/kraft/tcc.properties" <<EOF
 process.roles=broker,controller
 node.id=1

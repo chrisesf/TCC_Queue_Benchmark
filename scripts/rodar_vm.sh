@@ -24,14 +24,18 @@ fi
 
 PHASE=${PHASE:-tudo}
 REPS=${REPS:-30}
+# Progressao geometrica MPMC N×N (Secao 4.3). Ex.: SCALE="4" so o ponto unico antigo.
+SCALE=${SCALE:-"1 2 4 8 16 32"}
+SCALE_MAX=${SCALE_MAX:-}
+PIN_CORES=${PIN_CORES:-0}
 OUT=${OUT:-$ROOT/results/tcc}
 BIN_DIR=${BIN_DIR:-$ROOT/target/release}
-export PHASE REPS OUT BIN_DIR
+export PHASE REPS SCALE SCALE_MAX PIN_CORES OUT BIN_DIR
 export AMQP_URL="${AMQP_URL:-amqp://127.0.0.1:5672/%2f}"
 export KAFKA_BROKERS="${KAFKA_BROKERS:-127.0.0.1:9092}"
 export BROKER_CONTAINER=none
 
-echo "=== VM: $(hostname) | user=$(id -un) | nucleos=$(nproc) | phase=$PHASE reps=$REPS ==="
+echo "=== VM: $(hostname) | user=$(id -un) | nucleos=$(nproc) | phase=$PHASE reps=$REPS scale=[$SCALE] ==="
 command -v cargo >/dev/null || {
   echo "cargo nao encontrado. Rode: ./scripts/instalar_deps_vm.sh" >&2
   exit 1
